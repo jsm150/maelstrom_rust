@@ -1,7 +1,8 @@
-use std::{collections::HashSet, io::Write};
+use std::{collections::HashSet, io::Write, sync::Arc};
 
 use anyhow::{Ok, bail};
 use serde::{Deserialize, Serialize};
+use tokio::{io::{AsyncWrite, AsyncWriteExt}, sync::{Mutex, mpsc::{self, Receiver, Sender}}};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Message {
@@ -11,65 +12,56 @@ pub struct Message {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-enum RequestPayload {
-    
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum ResponsePayload {
-
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum Payload {
-
-    Request(RequestPayload),
-    Response(ResponsePayload),
-
+enum RequestPayload {
     Init {
         msg_id: usize,
         node_id: String,
         node_ids: Vec<String>
-    },  
-    InitOk {
-        in_reply_to: usize,
     },
     Echo {
         msg_id: usize,
         echo: String,
+    },
+    Generate {
+        msg_id: usize,
+    },
+    Broadcast {
+        msg_id: usize,
+        message: usize,
+    },
+    Read {
+        msg_id: usize,
+    },
+    Topology {
+        msg_id: usize,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponsePayload {
+    InitOk {
+        in_reply_to: usize,
     },
     EchoOk {
         msg_id: usize,
         in_reply_to: usize,
         echo: String,
     },
-    Generate {
-        msg_id: usize,
-    },
     GenerateOk {
         msg_id: usize,
         in_reply_to: usize,
         id: String,
     },
-    Broadcast {
-        msg_id: usize,
-        message: usize,
-    },
     BroadcastOk {
         msg_id: usize,
         in_reply_to: usize,
-    },
-    Read {
-        msg_id: usize,
     },
     ReadOk {
         msg_id: usize,
         in_reply_to: usize,
         messages: Vec<usize>,
-    },
-    Topology {
-        msg_id: usize,
     },
     TopologyOk {
         msg_id: usize,
@@ -77,40 +69,52 @@ enum Payload {
     },
 }
 
-pub struct Node<'a, W: Write> {
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Payload {
+    Request(RequestPayload),
+    Response(ResponsePayload),
+}
+
+pub struct Node {
     id: String,
     msg_seq: usize,
     messages: HashSet<usize>,
     neighbors: Vec<String>,
-    message_writer: &'a mut MessageWriter<'a, W>
+    message_sender: Sender<Message>
 }
 
-impl<'a, W: Write> Node<'a, W> {
-    pub fn init_and_recv(
+impl Node {
+    pub async fn init_and_recv<W: AsyncWrite + Send + Unpin + 'static>(
         message: Message,
-        message_writer: &'a mut MessageWriter<'a, W>
+        writer: W
     ) -> anyhow::Result<Self> {
-        if let Payload::Init {
+        if let Payload::Request(RequestPayload::Init {
             msg_id, node_id, node_ids
-        } = message.body
+        }) = message.body
         {
+            let (message_sender, recv) = mpsc::channel(1024);
+            
             let node = Self {
                 id: node_id,
                 msg_seq: 0,
                 messages: HashSet::new(),
                 neighbors: node_ids, 
-                message_writer
+                message_sender
             };
-
+            
+            let message_handler = MessageHandler::new(writer, recv);
+            message_handler.run_message_handling();
+            
             let res = Message {
                 src: node.id.to_string(),
                 dest: message.src,
-                body: Payload::InitOk {
+                body: Payload::Response(ResponsePayload::InitOk {
                     in_reply_to: msg_id,
-                },
+                }),
             };
 
-            node.message_writer.write(res)?;
+            node.message_sender.send(res).await?;
 
             Ok(node)
         } else {
@@ -118,106 +122,114 @@ impl<'a, W: Write> Node<'a, W> {
         }
     }
 
-    pub fn recv(
-        &mut self,
-        message: Message,
-    ) -> anyhow::Result<()> {
-        let body = match message.body {
-            Payload::Init { .. } => bail!(
-                "init 메세지는 init_and_recv에서 처리되어야 하는데도 recv함수에 전달되었습니다."
-            ),
-            Payload::InitOk { .. } => {
-                bail!("init_ok 메세지를 받을 일이 없음에도 이 노드가 메세지를 받았습니다.")
-            }
-            Payload::Echo { echo, msg_id } => Some(Payload::EchoOk {
+    async fn response(&mut self, sender: &str, payload: RequestPayload) -> anyhow::Result<()> {
+        let body = match payload {
+            RequestPayload::Echo { echo, msg_id } => Payload::Response(ResponsePayload::EchoOk {
                 msg_id: self.msg_seq,
                 in_reply_to: msg_id,
                 echo,
             }),
-            Payload::EchoOk { .. } => {
-                bail!("echo_ok 메세지를 받을 일이 없음에도 이 노드가 메세지를 받았습니다.")
-            }
-            Payload::Generate { msg_id } => Some(Payload::GenerateOk {
+            RequestPayload::Generate { msg_id } => Payload::Response(ResponsePayload::GenerateOk {
                 msg_id: self.msg_seq,
                 in_reply_to: msg_id,
                 id: format!("{}-{}", self.id, self.msg_seq),
             }),
-            Payload::GenerateOk { .. } => {
-                bail!("generate_ok 메세지를 받을 일이 없음에도 이 노드가 메세지를 받았습니다.")
-            }
-            Payload::Broadcast { msg_id, message } => {
+            RequestPayload::Broadcast { msg_id, message } => {
 
                 if self.messages.insert(message) {
                     for next_node in &self.neighbors {
                         let broadcast_message = Message {
                             dest: next_node.clone(),
                             src: self.id.clone(),
-                            body: Payload::Broadcast { msg_id: self.msg_seq, message }
+                            body: Payload::Request(RequestPayload::Broadcast { msg_id: self.msg_seq, message })
                         };
 
                         self.msg_seq += 1;
 
-                        self.message_writer.write(broadcast_message)?;
+                        self.message_sender.send(broadcast_message).await?;
                     }
                 }
 
-                Some(Payload::BroadcastOk {
+                Payload::Response(ResponsePayload::BroadcastOk {
                     msg_id: self.msg_seq,
                     in_reply_to: msg_id,
                 })
-            }
-            Payload::BroadcastOk { .. } => None,
-            Payload::Read { msg_id } => Some(Payload::ReadOk {
+            },
+            RequestPayload::Init { .. } => bail!(
+                "init 메세지는 init_and_recv에서 처리되어야 하는데도 recv함수에 전달되었습니다."
+            ),
+            RequestPayload::Read { msg_id } => Payload::Response(ResponsePayload::ReadOk {
                 msg_id: self.msg_seq,
                 in_reply_to: msg_id,
                 messages: self.messages.iter().copied().collect(),
             }),
-            Payload::ReadOk { .. } => {
-                bail!("read_ok 메세지를 받을 일이 없음에도 이 노드가 메세지를 받았습니다.")
-            }
-            Payload::Topology { msg_id } => Some(Payload::TopologyOk {
+            RequestPayload::Topology { msg_id } => Payload::Response(ResponsePayload::TopologyOk {
                 msg_id: self.msg_seq,
                 in_reply_to: msg_id,
             }),
-            Payload::TopologyOk { .. } => {
-                bail!("topology_ok 메세지를 받을 일이 없음에도 이 노드가 메세지를 받았습니다.")
-            }
         };
 
-        if let Some(body) = body {
-            let res = Message {
-                dest: message.src,
-                src: self.id.to_string(),
-                body,
-            };
-            self.message_writer.write(res)?;
+        let res = Message {
+            dest: sender.to_string(),
+            src: self.id.to_string(),
+            body,
+        };
+        self.message_sender.send(res).await?;
 
-            self.msg_seq += 1;
-        }
+        self.msg_seq += 1;
+
+        Ok(())
+    }
+
+    pub async fn recv(
+        &mut self,
+        message: Message,
+    ) -> anyhow::Result<()> {
+
+        match message.body {
+            Payload::Request(request_payload) => self.response(&message.src, request_payload).await?,
+            Payload::Response(response_payload) => match response_payload {
+                ResponsePayload::BroadcastOk { msg_id, in_reply_to } => {
+
+                },
+                _ => { }
+            },
+        };
 
         Ok(())
     }
 
     
+    
 }
 
-
-pub struct MessageWriter<'a, W> 
-where W: Write {
-    writer: &'a mut W
+struct MessageHandler<W> 
+where W: AsyncWrite {
+    recv: mpsc::Receiver<Message>,
+    writer: W
 }
 
-impl<'a, W> MessageWriter<'a, W>
-where W: Write {
-    pub fn new(writer: &'a mut W) -> Self {
-        Self { writer }
+impl<W> MessageHandler<W> 
+where W: AsyncWrite + Send + 'static + Unpin {
+    pub fn new(writer: W, recv: Receiver<Message>) -> Self {
+        Self {
+            writer,
+            recv
+        }
     }
 
-    pub fn write(&mut self, message: Message) -> anyhow::Result<()> {
-        serde_json::to_writer(&mut *self.writer, &message)?;
-        self.writer.write_all(b"\n")?;
-        self.writer.flush()?;
+    pub fn run_message_handling(mut self) {
+        tokio::spawn(async move {
+            while let Some(message) = self.recv.recv().await {
+                let mut bytes = serde_json::to_vec(&message)?;
+                bytes.push(b'\n');
 
-        Ok(())
+                self.writer.write_all(&bytes).await?;
+                self.writer.flush().await?;
+            }
+
+            Ok(())
+        });
     }
+
 }
