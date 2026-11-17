@@ -28,6 +28,7 @@ impl Message {
                     RequestPayload::Broadcast { msg_id, .. } => msg_id,
                     RequestPayload::Read { msg_id } => msg_id,
                     RequestPayload::Topology { msg_id, .. } => msg_id,
+                    RequestPayload::Unicast { msg_id, .. } => msg_id,
                 };
 
                 format!("{}-{}", self.dest, msg_id)
@@ -40,6 +41,7 @@ impl Message {
                     ResponsePayload::BroadcastOk { in_reply_to, .. } => in_reply_to,
                     ResponsePayload::ReadOk { in_reply_to, .. } => in_reply_to,
                     ResponsePayload::TopologyOk { in_reply_to, .. } => in_reply_to,
+                    ResponsePayload::UnicastOk { in_reply_to, .. } => in_reply_to,
                 };
 
                 format!("{}-{}", self.src, in_reply_to)
@@ -64,6 +66,10 @@ enum RequestPayload {
         msg_id: usize,
     },
     Broadcast {
+        msg_id: usize,
+        message: usize,
+    },
+    Unicast {
         msg_id: usize,
         message: usize,
     },
@@ -94,6 +100,10 @@ pub enum ResponsePayload {
         id: String,
     },
     BroadcastOk {
+        msg_id: usize,
+        in_reply_to: usize,
+    },
+    UnicastOk {
         msg_id: usize,
         in_reply_to: usize,
     },
@@ -132,16 +142,17 @@ impl Node {
         message: Message,
     ) -> anyhow::Result<(Self, Receiver<Packet>)> {
         if let Payload::Request(RequestPayload::Init {
-            msg_id, node_id, ..
+            msg_id, node_id, node_ids
         }) = message.body
         {
             let (message_sender, recv) = mpsc::channel(1024);
-            
+            let neighbors = node_ids.into_iter().filter(|n| *n != node_id).collect();
+
             let node = Self {
                 id: node_id,
                 msg_seq: 1,
                 messages: HashSet::new(),
-                neighbors: vec![], 
+                neighbors,
                 message_sender
             };
             
@@ -182,7 +193,7 @@ impl Node {
                         let broadcast_message = Message {
                             dest: next_node.clone(),
                             src: self.id.clone(),
-                            body: Payload::Request(RequestPayload::Broadcast { msg_id: self.msg_seq, message })
+                            body: Payload::Request(RequestPayload::Unicast { msg_id: self.msg_seq, message })
                         };
 
                         self.msg_seq += 1;
@@ -196,6 +207,14 @@ impl Node {
                     in_reply_to: msg_id,
                 })
             },
+            RequestPayload::Unicast { msg_id, message } => {
+                self.messages.insert(message);
+                
+                Payload::Response(ResponsePayload::UnicastOk {
+                    msg_id: self.msg_seq,
+                    in_reply_to: msg_id,
+                })
+            },
             RequestPayload::Init { .. } => bail!(
                 "init 메세지는 init_and_recv에서 처리되어야 하는데도 recv함수에 전달되었습니다."
             ),
@@ -204,9 +223,7 @@ impl Node {
                 in_reply_to: msg_id,
                 messages: self.messages.iter().copied().collect(),
             }),
-            RequestPayload::Topology { msg_id, mut topology } => {
-                self.neighbors = topology.remove(&self.id)
-                    .ok_or_else(|| anyhow::anyhow!("topology에 노드 {}가 없습니다", self.id))?;
+            RequestPayload::Topology { msg_id, .. } => {
 
                 Payload::Response(ResponsePayload::TopologyOk {
                     msg_id: self.msg_seq,
