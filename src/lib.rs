@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail};
+use anyhow::bail;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
@@ -30,31 +30,11 @@ pub enum Packet {
 impl Message {
     fn unique_id(&self) -> String {
         match &self.body {
-            Payload::Request(request_payload) => {
-                let msg_id = match request_payload {
-                    RequestPayload::Init { msg_id, .. } => msg_id,
-                    RequestPayload::Echo { msg_id, .. } => msg_id,
-                    RequestPayload::Generate { msg_id } => msg_id,
-                    RequestPayload::Broadcast { msg_id, .. } => msg_id,
-                    RequestPayload::Read { msg_id } => msg_id,
-                    RequestPayload::Topology { msg_id, .. } => msg_id,
-                    RequestPayload::Unicast { msg_id, .. } => msg_id,
-                };
-
-                format!("{}-{}", self.dest, msg_id)
+            Payload::Request(body) => {
+                format!("{}-{}", self.dest, body.msg_id)
             }
-            Payload::Response(response_payload) => {
-                let in_reply_to = match response_payload {
-                    ResponsePayload::InitOk { in_reply_to, .. } => in_reply_to,
-                    ResponsePayload::EchoOk { in_reply_to, .. } => in_reply_to,
-                    ResponsePayload::GenerateOk { in_reply_to, .. } => in_reply_to,
-                    ResponsePayload::BroadcastOk { in_reply_to, .. } => in_reply_to,
-                    ResponsePayload::ReadOk { in_reply_to, .. } => in_reply_to,
-                    ResponsePayload::TopologyOk { in_reply_to, .. } => in_reply_to,
-                    ResponsePayload::UnicastOk { in_reply_to, .. } => in_reply_to,
-                };
-
-                format!("{}-{}", self.src, in_reply_to)
+            Payload::Response(body) => {
+                format!("{}-{}", self.src, body.in_reply_to)
             }
         }
     }
@@ -64,30 +44,21 @@ impl Message {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RequestPayload {
     Init {
-        msg_id: usize,
         node_id: String,
         node_ids: Vec<String>,
     },
     Echo {
-        msg_id: usize,
         echo: String,
     },
-    Generate {
-        msg_id: usize,
-    },
+    Generate,
     Broadcast {
-        msg_id: usize,
         message: usize,
     },
     Unicast {
-        msg_id: usize,
         messages: Vec<usize>,
     },
-    Read {
-        msg_id: usize,
-    },
+    Read,
     Topology {
-        msg_id: usize,
         topology: HashMap<String, Vec<String>>,
     },
 }
@@ -95,44 +66,35 @@ enum RequestPayload {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponsePayload {
-    InitOk {
-        msg_id: usize,
-        in_reply_to: usize,
-    },
-    EchoOk {
-        msg_id: usize,
-        in_reply_to: usize,
-        echo: String,
-    },
-    GenerateOk {
-        msg_id: usize,
-        in_reply_to: usize,
-        id: String,
-    },
-    BroadcastOk {
-        msg_id: usize,
-        in_reply_to: usize,
-    },
-    UnicastOk {
-        msg_id: usize,
-        in_reply_to: usize,
-    },
-    ReadOk {
-        msg_id: usize,
-        in_reply_to: usize,
-        messages: Vec<usize>,
-    },
-    TopologyOk {
-        msg_id: usize,
-        in_reply_to: usize,
-    },
+    InitOk,
+    EchoOk { echo: String },
+    GenerateOk { id: String },
+    BroadcastOk,
+    UnicastOk,
+    ReadOk { messages: Vec<usize> },
+    TopologyOk,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RequestBody {
+    msg_id: usize,
+    #[serde(flatten)]
+    payload: RequestPayload,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResponseBody {
+    msg_id: usize,
+    in_reply_to: usize,
+    #[serde(flatten)]
+    payload: ResponsePayload,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 enum Payload {
-    Request(RequestPayload),
-    Response(ResponsePayload),
+    Request(RequestBody),
+    Response(ResponseBody),
 }
 
 #[derive(Clone)]
@@ -168,10 +130,9 @@ impl Node {
     }
 
     pub async fn init_and_recv(message: Message) -> anyhow::Result<(Self, Receiver<Packet>)> {
-        if let Payload::Request(RequestPayload::Init {
+        if let Payload::Request(RequestBody {
             msg_id,
-            node_id,
-            node_ids,
+            payload: RequestPayload::Init { node_id, node_ids },
         }) = message.body
         {
             let (message_sender, recv) = mpsc::channel(1024);
@@ -196,9 +157,10 @@ impl Node {
             let res = Message {
                 src: node.id.to_string(),
                 dest: message.src,
-                body: Payload::Response(ResponsePayload::InitOk {
+                body: Payload::Response(ResponseBody {
                     msg_id: 0,
                     in_reply_to: msg_id,
+                    payload: ResponsePayload::InitOk,
                 }),
             };
 
@@ -210,61 +172,45 @@ impl Node {
         }
     }
 
-    async fn response(&mut self, sender: &str, payload: RequestPayload) -> anyhow::Result<()> {
-        let body = match payload {
-            RequestPayload::Echo { echo, msg_id } => Payload::Response(ResponsePayload::EchoOk {
-                msg_id: self.msg_seq.next(),
-                in_reply_to: msg_id,
-                echo,
-            }),
-            RequestPayload::Generate { msg_id } => {
-                let msg_seq = self.msg_seq.next();
-                Payload::Response(ResponsePayload::GenerateOk {
-                    msg_id: msg_seq,
-                    in_reply_to: msg_id,
-                    id: format!("{}-{}", self.id, msg_seq),
-                })
-            }
-            RequestPayload::Broadcast { msg_id, message } => {
+    async fn response(&mut self, sender: &str, body: RequestBody) -> anyhow::Result<()> {
+        let RequestBody { msg_id, payload } = body;
+        let response_id = self.msg_seq.next();
+        let response_payload = match payload {
+            RequestPayload::Echo { echo } => ResponsePayload::EchoOk { echo },
+            RequestPayload::Generate => ResponsePayload::GenerateOk {
+                id: format!("{}-{}", self.id, response_id),
+            },
+            RequestPayload::Broadcast { message } => {
                 if self.messages.insert(message) {
                     self.batch_sender.send(payload).await?;
                 }
 
-                Payload::Response(ResponsePayload::BroadcastOk {
-                    msg_id: self.msg_seq.next(),
-                    in_reply_to: msg_id,
-                })
+                ResponsePayload::BroadcastOk
             }
-            RequestPayload::Unicast { msg_id, messages } => {
+            RequestPayload::Unicast { messages } => {
                 messages.iter().for_each(|message| {
                     self.messages.insert(*message);
                 });
 
-                Payload::Response(ResponsePayload::UnicastOk {
-                    msg_id: self.msg_seq.next(),
-                    in_reply_to: msg_id,
-                })
+                ResponsePayload::UnicastOk
             }
             RequestPayload::Init { .. } => bail!(
                 "init 메세지는 init_and_recv에서 처리되어야 하는데도 recv함수에 전달되었습니다."
             ),
-            RequestPayload::Read { msg_id } => Payload::Response(ResponsePayload::ReadOk {
-                msg_id: self.msg_seq.next(),
-                in_reply_to: msg_id,
+            RequestPayload::Read => ResponsePayload::ReadOk {
                 messages: self.messages.iter().copied().collect(),
-            }),
-            RequestPayload::Topology { msg_id, .. } => {
-                Payload::Response(ResponsePayload::TopologyOk {
-                    msg_id: self.msg_seq.next(),
-                    in_reply_to: msg_id,
-                })
-            }
+            },
+            RequestPayload::Topology { .. } => ResponsePayload::TopologyOk,
         };
 
         let res = Message {
             dest: sender.to_string(),
             src: self.id.to_string(),
-            body,
+            body: Payload::Response(ResponseBody {
+                msg_id: response_id,
+                in_reply_to: msg_id,
+                payload: response_payload,
+            }),
         };
         self.message_sender.send(Packet::Outgoing(res)).await?;
 
@@ -273,15 +219,13 @@ impl Node {
 
     pub async fn recv(&mut self, message: Message) -> anyhow::Result<()> {
         match message.body {
-            Payload::Request(request_payload) => {
-                self.response(&message.src, request_payload).await?
-            }
-            Payload::Response(response_payload) => {
+            Payload::Request(request_body) => self.response(&message.src, request_body).await?,
+            Payload::Response(response_body) => {
                 self.message_sender
                     .send(Packet::Incoming(Message {
                         src: message.src,
                         dest: message.dest,
-                        body: Payload::Response(response_payload),
+                        body: Payload::Response(response_body),
                     }))
                     .await?;
             }
@@ -383,14 +327,14 @@ impl BroadcastBatch {
         recv: Receiver<RequestPayload>,
         packet_sender: Sender<Packet>,
         msg_seq: MessageNumbering,
-        neighbors: Vec<String>
+        neighbors: Vec<String>,
     ) -> Self {
         Self {
             node_id,
             recv,
             packet_sender,
             msg_seq,
-            neighbors
+            neighbors,
         }
     }
 
@@ -399,7 +343,7 @@ impl BroadcastBatch {
             tokio::time::sleep(delay).await;
 
             let mut messages = vec![];
-            while let Ok(RequestPayload::Broadcast { message, .. }) = self.recv.try_recv() {
+            while let Ok(RequestPayload::Broadcast { message }) = self.recv.try_recv() {
                 messages.push(message);
             }
 
@@ -411,9 +355,11 @@ impl BroadcastBatch {
                 let broadcast_message = Message {
                     dest: next_node.clone(),
                     src: self.node_id.clone(),
-                    body: Payload::Request(RequestPayload::Unicast {
+                    body: Payload::Request(RequestBody {
                         msg_id: self.msg_seq.next(),
-                        messages: messages.clone(),
+                        payload: RequestPayload::Unicast {
+                            messages: messages.clone(),
+                        },
                     }),
                 };
 
@@ -424,3 +370,6 @@ impl BroadcastBatch {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
