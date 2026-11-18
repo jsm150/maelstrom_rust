@@ -1,376 +1,134 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, atomic::AtomicUsize},
-    time::Duration,
-};
+mod transport;
 
-use anyhow::bail;
-use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncWrite, AsyncWriteExt},
-    sync::{
-        Mutex,
-        mpsc::{self, Receiver, Sender},
+use std::future::Future;
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, BufReader};
+
+pub use transport::NodeTx;
+
+/// 한 워크로드에서 사용하는 요청·응답 본문 타입을 지정한다. 각 본문은 `type` 필드로 메시지 종류를 구분한다.
+pub trait Payload {
+    type Request: Serialize + DeserializeOwned + Send + 'static;
+    type Response: Serialize + DeserializeOwned + Send + 'static;
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct Message<P: Payload> {
+    pub src: String,
+    pub dest: String,
+    pub body: Body<P>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged, bound = "")]
+pub enum Body<P: Payload> {
+    // Serde는 선언 순서대로 역직렬화를 시도하므로, in_reply_to가 필요한 응답을 먼저 검사한다.
+    Response {
+        msg_id: usize,
+        in_reply_to: usize,
+        #[serde(flatten)]
+        payload: P::Response,
     },
-};
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Message {
-    src: String,
-    dest: String,
-    body: Payload,
+    Request {
+        msg_id: usize,
+        #[serde(flatten)]
+        payload: P::Request,
+    },
 }
 
-#[derive(Debug)]
-pub enum Packet {
-    Outgoing(Message),
-    Incoming(Message),
+#[derive(Serialize, Deserialize)]
+pub struct Init {
+    pub node_id: String,
+    pub node_ids: Vec<String>,
 }
 
-impl Message {
-    fn unique_id(&self) -> String {
-        match &self.body {
-            Payload::Request(body) => {
-                format!("{}-{}", self.dest, body.msg_id)
-            }
-            Payload::Response(body) => {
-                format!("{}-{}", self.src, body.in_reply_to)
-            }
-        }
-    }
+struct InitPayload;
+
+impl Payload for InitPayload {
+    type Request = InitRequest;
+    type Response = InitResponse;
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum RequestPayload {
-    Init {
-        node_id: String,
-        node_ids: Vec<String>,
-    },
-    Echo {
-        echo: String,
-    },
-    Generate,
-    Broadcast {
-        message: usize,
-    },
-    Unicast {
-        messages: Vec<usize>,
-    },
-    Read,
-    Topology {
-        topology: HashMap<String, Vec<String>>,
-    },
+enum InitRequest {
+    Init(Init),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponsePayload {
+enum InitResponse {
     InitOk,
-    EchoOk { echo: String },
-    GenerateOk { id: String },
-    BroadcastOk,
-    UnicastOk,
-    ReadOk { messages: Vec<usize> },
-    TopologyOk,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct RequestBody {
-    msg_id: usize,
-    #[serde(flatten)]
-    payload: RequestPayload,
+pub trait Node: Sized {
+    type Payload: Payload;
+
+    fn init(init: Init, tx: NodeTx<Self::Payload>) -> Result<Self>;
+    /// 메시지를 하나씩 처리한다. 여기서 보낸 요청의 응답은 이후 호출에서 받는다.
+    fn recv(&mut self, message: Message<Self::Payload>) -> impl Future<Output = Result<()>>;
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ResponseBody {
-    msg_id: usize,
-    in_reply_to: usize,
-    #[serde(flatten)]
-    payload: ResponsePayload,
+pub async fn main_loop<N: Node>() -> Result<()> {
+    run::<N>(BufReader::new(tokio::io::stdin()), tokio::io::stdout()).await
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-enum Payload {
-    Request(RequestBody),
-    Response(ResponseBody),
-}
+async fn run<N: Node>(
+    input: impl AsyncBufRead + Unpin,
+    mut output: impl AsyncWrite + Unpin,
+) -> Result<()> {
+    let mut lines = input.lines();
+    let first = lines
+        .next_line()
+        .await?
+        .context("init 메시지를 받기 전에 입력이 종료되었습니다")?;
+    let message: Message<InitPayload> =
+        serde_json::from_str(&first).context("init 메시지 해석 실패")?;
+    let Body::Request {
+        msg_id,
+        payload: InitRequest::Init(init),
+    } = message.body
+    else {
+        bail!("첫 메시지는 init 요청이어야 합니다");
+    };
 
-#[derive(Clone)]
-struct MessageNumbering {
-    msg_seq: Arc<AtomicUsize>,
-}
+    let reply = Message::<InitPayload> {
+        src: init.node_id.clone(),
+        dest: message.src,
+        body: Body::Response {
+            msg_id: 0,
+            in_reply_to: msg_id,
+            payload: InitResponse::InitOk,
+        },
+    };
+    let (tx, commands) = NodeTx::new(&init.node_id);
+    let mut node = N::init(init, tx.clone())?;
+    transport::write_frame(&mut output, &transport::encode(&reply)?).await?;
 
-impl MessageNumbering {
-    fn new() -> Self {
-        Self {
-            msg_seq: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn next(&self) -> usize {
-        self.msg_seq
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1
-    }
-}
-
-pub struct Node {
-    id: String,
-    msg_seq: MessageNumbering,
-    messages: HashSet<usize>,
-    message_sender: Sender<Packet>,
-    batch_sender: Sender<RequestPayload>,
-}
-
-impl Node {
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub async fn init_and_recv(message: Message) -> anyhow::Result<(Self, Receiver<Packet>)> {
-        if let Payload::Request(RequestBody {
-            msg_id,
-            payload: RequestPayload::Init { node_id, node_ids },
-        }) = message.body
-        {
-            let (message_sender, recv) = mpsc::channel(1024);
-            let (batch_sender, batch_recv) = mpsc::channel(1024);
-
-            let neighbors = node_ids.into_iter().filter(|n| *n != node_id).collect();
-            let msg_seq: MessageNumbering = MessageNumbering::new();
-
-            let node = Self {
-                id: node_id.clone(),
-                msg_seq: msg_seq.clone(),
-                messages: HashSet::new(),
-                message_sender: message_sender.clone(),
-                batch_sender,
-            };
-
-            tokio::spawn(
-                BroadcastBatch::new(node_id, batch_recv, message_sender, msg_seq, neighbors)
-                    .run(Duration::from_millis(700)),
-            );
-
-            let res = Message {
-                src: node.id.to_string(),
-                dest: message.src,
-                body: Payload::Response(ResponseBody {
-                    msg_id: 0,
-                    in_reply_to: msg_id,
-                    payload: ResponsePayload::InitOk,
-                }),
-            };
-
-            node.message_sender.send(Packet::Outgoing(res)).await?;
-
-            Ok((node, recv))
-        } else {
-            bail!("Node의 init 함수는 Payload가 init인 메세지만 받을 수 있습니다.")
-        }
-    }
-
-    async fn response(&mut self, sender: &str, body: RequestBody) -> anyhow::Result<()> {
-        let RequestBody { msg_id, payload } = body;
-        let response_id = self.msg_seq.next();
-        let response_payload = match payload {
-            RequestPayload::Echo { echo } => ResponsePayload::EchoOk { echo },
-            RequestPayload::Generate => ResponsePayload::GenerateOk {
-                id: format!("{}-{}", self.id, response_id),
-            },
-            RequestPayload::Broadcast { message } => {
-                if self.messages.insert(message) {
-                    self.batch_sender.send(payload).await?;
+    let mut writer = std::pin::pin!(transport::write_messages(commands, output));
+    let input_result = tokio::select! {
+        result = async move {
+            while let Some(line) = lines.next_line().await? {
+                let message: Message<N::Payload> = serde_json::from_str(&line)?;
+                if let Body::Response { in_reply_to, .. } = &message.body {
+                    tx.acknowledge(&message.src, *in_reply_to).await?;
                 }
-
-                ResponsePayload::BroadcastOk
+                node.recv(message).await?;
             }
-            RequestPayload::Unicast { messages } => {
-                messages.iter().for_each(|message| {
-                    self.messages.insert(*message);
-                });
-
-                ResponsePayload::UnicastOk
-            }
-            RequestPayload::Init { .. } => bail!(
-                "init 메세지는 init_and_recv에서 처리되어야 하는데도 recv함수에 전달되었습니다."
-            ),
-            RequestPayload::Read => ResponsePayload::ReadOk {
-                messages: self.messages.iter().copied().collect(),
-            },
-            RequestPayload::Topology { .. } => ResponsePayload::TopologyOk,
-        };
-
-        let res = Message {
-            dest: sender.to_string(),
-            src: self.id.to_string(),
-            body: Payload::Response(ResponseBody {
-                msg_id: response_id,
-                in_reply_to: msg_id,
-                payload: response_payload,
-            }),
-        };
-        self.message_sender.send(Packet::Outgoing(res)).await?;
-
-        Ok(())
-    }
-
-    pub async fn recv(&mut self, message: Message) -> anyhow::Result<()> {
-        match message.body {
-            Payload::Request(request_body) => self.response(&message.src, request_body).await?,
-            Payload::Response(response_body) => {
-                self.message_sender
-                    .send(Packet::Incoming(Message {
-                        src: message.src,
-                        dest: message.dest,
-                        body: Payload::Response(response_body),
-                    }))
-                    .await?;
-            }
-        };
-
-        Ok(())
-    }
-}
-
-pub struct MessageHandler<W>
-where
-    W: AsyncWrite,
-{
-    recv: mpsc::Receiver<Packet>,
-    writer: Arc<Mutex<W>>,
-    sending_state: Arc<Mutex<HashSet<String>>>,
-}
-
-impl<W> MessageHandler<W>
-where
-    W: AsyncWrite + Send + 'static + Unpin,
-{
-    pub fn new(writer: W, recv: Receiver<Packet>) -> Self {
-        Self {
-            writer: Arc::new(Mutex::new(writer)),
-            recv,
-            sending_state: Arc::new(Mutex::new(HashSet::new())),
+            Ok(())
+        } => result,
+        result = &mut writer => {
+            result?;
+            bail!("입력 처리 중 출력이 종료되었습니다");
         }
-    }
+    };
 
-    pub async fn run_message_handling(mut self) -> anyhow::Result<()> {
-        while let Some(packet) = self.recv.recv().await {
-            match packet {
-                Packet::Incoming(message) => {
-                    let message_id = message.unique_id();
-                    self.sending_state.lock().await.remove(&message_id);
-                }
-                Packet::Outgoing(message) => match message.body {
-                    Payload::Request(_) => {
-                        tokio::spawn(Self::send_until_done(
-                            message,
-                            self.writer.clone(),
-                            self.sending_state.clone(),
-                        ));
-                    }
-                    Payload::Response(_) => {
-                        Self::send(&message, self.writer.clone()).await?;
-                    }
-                },
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn send(message: &Message, writer: Arc<Mutex<W>>) -> anyhow::Result<()> {
-        let mut bytes = serde_json::to_vec(&message)?;
-        bytes.push(b'\n');
-
-        writer.lock().await.write_all(&bytes).await?;
-
-        writer.lock().await.flush().await?;
-
-        Ok(())
-    }
-
-    async fn send_until_done(
-        message: Message,
-        writer: Arc<Mutex<W>>,
-        sending_state: Arc<Mutex<HashSet<String>>>,
-    ) -> anyhow::Result<()> {
-        sending_state.lock().await.insert(message.unique_id());
-
-        loop {
-            Self::send(&message, writer.clone()).await?;
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            if !sending_state.lock().await.contains(&message.unique_id()) {
-                break;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-struct BroadcastBatch {
-    node_id: String,
-    recv: Receiver<RequestPayload>,
-    packet_sender: Sender<Packet>,
-    msg_seq: MessageNumbering,
-    neighbors: Vec<String>,
-}
-
-impl BroadcastBatch {
-    pub fn new(
-        node_id: String,
-        recv: Receiver<RequestPayload>,
-        packet_sender: Sender<Packet>,
-        msg_seq: MessageNumbering,
-        neighbors: Vec<String>,
-    ) -> Self {
-        Self {
-            node_id,
-            recv,
-            packet_sender,
-            msg_seq,
-            neighbors,
-        }
-    }
-
-    pub async fn run(mut self, delay: Duration) -> anyhow::Result<()> {
-        while !self.recv.is_closed() || !self.recv.is_empty() {
-            tokio::time::sleep(delay).await;
-
-            let mut messages = vec![];
-            while let Ok(RequestPayload::Broadcast { message }) = self.recv.try_recv() {
-                messages.push(message);
-            }
-
-            if messages.is_empty() {
-                continue;
-            }
-
-            for next_node in &self.neighbors {
-                let broadcast_message = Message {
-                    dest: next_node.clone(),
-                    src: self.node_id.clone(),
-                    body: Payload::Request(RequestBody {
-                        msg_id: self.msg_seq.next(),
-                        payload: RequestPayload::Unicast {
-                            messages: messages.clone(),
-                        },
-                    }),
-                };
-
-                self.packet_sender
-                    .send(Packet::Outgoing(broadcast_message))
-                    .await?;
-            }
-        }
-
-        Ok(())
-    }
+    // 입력 처리가 끝나면 노드가 해제된다. 배치 태스크가 마지막 배치를 보내고 출력이 끝날 때까지 기다린다.
+    writer.await?;
+    input_result
 }
 
 #[cfg(test)]

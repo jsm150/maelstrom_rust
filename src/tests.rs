@@ -1,204 +1,203 @@
 use super::*;
 use serde_json::{Value, json};
+use tokio::{
+    io::{AsyncWriteExt, duplex},
+    time::{Duration, timeout},
+};
 
-fn wire_messages() -> Vec<Value> {
-    [
-        json!({"type": "init", "msg_id": 7, "node_id": "n0", "node_ids": ["n0", "n1"]}),
-        json!({"type": "echo", "msg_id": 7, "echo": "hello"}),
-        json!({"type": "generate", "msg_id": 7}),
-        json!({"type": "broadcast", "msg_id": 7, "message": 42}),
-        json!({"type": "unicast", "msg_id": 7, "messages": [42, 43]}),
-        json!({"type": "read", "msg_id": 7}),
-        json!({"type": "topology", "msg_id": 7, "topology": {"n0": ["n1"], "n1": ["n0"]}}),
-        json!({"type": "init_ok", "msg_id": 13, "in_reply_to": 7}),
-        json!({"type": "echo_ok", "msg_id": 13, "in_reply_to": 7, "echo": "hello"}),
-        json!({"type": "generate_ok", "msg_id": 13, "in_reply_to": 7, "id": "n0-13"}),
-        json!({"type": "broadcast_ok", "msg_id": 13, "in_reply_to": 7}),
-        json!({"type": "unicast_ok", "msg_id": 13, "in_reply_to": 7}),
-        json!({"type": "read_ok", "msg_id": 13, "in_reply_to": 7, "messages": [42, 43]}),
-        json!({"type": "topology_ok", "msg_id": 13, "in_reply_to": 7}),
-    ]
-    .into_iter()
-    .map(|body| {
-        let (src, dest) = if body.get("in_reply_to").is_some() {
-            ("n0", "n1")
-        } else {
-            ("n1", "n0")
-        };
-        json!({"src": src, "dest": dest, "body": body})
-    })
-    .collect()
+struct ProbePayload;
+
+impl Payload for ProbePayload {
+    type Request = ProbeRequest;
+    type Response = ProbeResponse;
 }
 
-#[test]
-fn all_message_variants_preserve_the_wire_format() {
-    for wire in wire_messages() {
-        let message: Message = serde_json::from_value(wire.clone()).unwrap();
-        assert_eq!(
-            matches!(&message.body, Payload::Response(_)),
-            wire["body"].get("in_reply_to").is_some(),
-        );
-        assert_eq!(serde_json::to_value(message).unwrap(), wire);
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ProbeRequest {
+    Start,
+    Read,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ProbeResponse {
+    ReadOk { value: usize },
+}
+
+struct ProbeNode {
+    tx: NodeTx<ProbePayload>,
+}
+
+impl Node for ProbeNode {
+    type Payload = ProbePayload;
+
+    fn init(_: Init, tx: NodeTx<ProbePayload>) -> Result<Self> {
+        Ok(Self { tx })
     }
-}
 
-#[test]
-fn common_identifiers_remain_required() {
-    for wire in wire_messages() {
-        for field in ["msg_id", "in_reply_to"] {
-            let mut incomplete = wire.clone();
-            if incomplete["body"]
-                .as_object_mut()
-                .unwrap()
-                .remove(field)
-                .is_some()
-            {
-                assert!(
-                    serde_json::from_value::<Message>(incomplete).is_err(),
-                    "{} must require {field}",
-                    wire["body"]["type"],
-                );
+    async fn recv(&mut self, message: Message<ProbePayload>) -> Result<()> {
+        match message.body {
+            Body::Request {
+                payload: ProbeRequest::Start,
+                ..
+            } => {
+                self.tx.request("n1", ProbeRequest::Read).await?;
+                self.tx.request_with_retry("n2", ProbeRequest::Read).await?;
             }
+            Body::Response {
+                in_reply_to,
+                payload,
+                ..
+            } => {
+                self.tx.reply("c0", in_reply_to, |_| payload).await?;
+            }
+            _ => {}
         }
+        Ok(())
     }
 }
 
-async fn next_packet(recv: &mut Receiver<Packet>) -> Packet {
-    tokio::time::timeout(Duration::from_secs(1), recv.recv())
-        .await
-        .expect("message was not queued")
-        .expect("message channel closed")
+fn wire(src: &str, dest: &str, body: Value) -> Value {
+    json!({"src": src, "dest": dest, "body": body})
 }
 
-async fn next_outgoing(recv: &mut Receiver<Packet>) -> Message {
-    match next_packet(recv).await {
-        Packet::Outgoing(message) => message,
-        packet => panic!("expected an outgoing message, got {packet:?}"),
-    }
-}
-
-#[tokio::test]
-async fn node_responses_preserve_identifiers_and_data() {
-    let init = serde_json::from_value(json!({
-        "src": "c0", "dest": "n0",
-        "body": {"type": "init", "msg_id": 70, "node_id": "n0", "node_ids": ["n0"]},
-    }))
-    .unwrap();
-    let (mut node, mut recv) = Node::init_and_recv(init).await.unwrap();
+fn check_wire<P: Payload>(body: Value) {
+    let message = wire("c0", "n0", body);
+    let parsed: Message<P> = serde_json::from_value(message.clone()).unwrap();
     assert_eq!(
-        serde_json::to_value(next_outgoing(&mut recv).await).unwrap(),
-        json!({
-            "src": "n0", "dest": "c0",
-            "body": {"type": "init_ok", "msg_id": 0, "in_reply_to": 70},
-        }),
+        matches!(parsed.body, Body::Response { .. }),
+        message["body"].get("in_reply_to").is_some()
     );
-
-    let cases = [
-        (
-            "c0",
-            json!({"type": "echo", "msg_id": 71, "echo": "hello"}),
-            json!({"type": "echo_ok", "msg_id": 1, "in_reply_to": 71, "echo": "hello"}),
-        ),
-        (
-            "c0",
-            json!({"type": "generate", "msg_id": 72}),
-            json!({"type": "generate_ok", "msg_id": 2, "in_reply_to": 72, "id": "n0-2"}),
-        ),
-        (
-            "n1",
-            json!({"type": "unicast", "msg_id": 73, "messages": [10, 20]}),
-            json!({"type": "unicast_ok", "msg_id": 3, "in_reply_to": 73}),
-        ),
-        (
-            "c0",
-            json!({"type": "broadcast", "msg_id": 74, "message": 30}),
-            json!({"type": "broadcast_ok", "msg_id": 4, "in_reply_to": 74}),
-        ),
-        (
-            "c0",
-            json!({"type": "topology", "msg_id": 75, "topology": {"n0": []}}),
-            json!({"type": "topology_ok", "msg_id": 5, "in_reply_to": 75}),
-        ),
-        (
-            "c0",
-            json!({"type": "read", "msg_id": 76}),
-            json!({"type": "read_ok", "msg_id": 6, "in_reply_to": 76, "messages": [10, 20, 30]}),
-        ),
-    ];
-    for (src, body, expected_body) in cases {
-        let request =
-            serde_json::from_value(json!({"src": src, "dest": "n0", "body": body})).unwrap();
-        node.recv(request).await.unwrap();
-        let mut response = serde_json::to_value(next_outgoing(&mut recv).await).unwrap();
-        if let Some(messages) = response["body"]
-            .get_mut("messages")
-            .and_then(Value::as_array_mut)
+    assert_eq!(serde_json::to_value(parsed).unwrap(), message);
+    for key in ["msg_id", "in_reply_to"] {
+        let mut incomplete = message.clone();
+        if incomplete["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove(key)
+            .is_some()
         {
-            messages.sort_by_key(|value| value.as_u64().unwrap());
+            assert!(serde_json::from_value::<Message<P>>(incomplete).is_err());
         }
-        assert_eq!(
-            response,
-            json!({"src": "n0", "dest": src, "body": expected_body}),
-        );
     }
-
-    let reply = json!({
-        "src": "n1", "dest": "n0",
-        "body": {"type": "unicast_ok", "msg_id": 900, "in_reply_to": 27},
-    });
-    node.recv(serde_json::from_value(reply.clone()).unwrap())
-        .await
-        .unwrap();
-    let Packet::Incoming(message) = next_packet(&mut recv).await else {
-        panic!("received reply must be forwarded as Incoming");
-    };
-    assert_eq!(serde_json::to_value(message).unwrap(), reply);
 }
 
-#[tokio::test]
-async fn batches_receive_fresh_ids_and_replies_match_requests() {
-    let (batch_sender, batch_recv) = mpsc::channel(8);
-    let (packet_sender, mut recv) = mpsc::channel(8);
-    let numbering = MessageNumbering::new();
-    assert_eq!(numbering.next(), 1);
-    for message in [10, 20] {
-        batch_sender
-            .send(RequestPayload::Broadcast { message })
-            .await
-            .unwrap();
-    }
-    drop(batch_sender);
-    let batch = BroadcastBatch::new(
-        "n0".into(),
-        batch_recv,
-        packet_sender,
-        numbering.clone(),
-        vec!["n1".into(), "n2".into()],
+#[test]
+fn wire_format_and_required_ids() {
+    check_wire::<InitPayload>(
+        json!({"type": "init", "msg_id": 7, "node_id": "n0", "node_ids": ["n0"]}),
     );
-    let task = tokio::spawn(batch.run(Duration::from_millis(1)));
+    check_wire::<InitPayload>(json!({"type": "init_ok", "msg_id": 0, "in_reply_to": 7}));
+    check_wire::<ProbePayload>(json!({"type": "read", "msg_id": 1}));
+    check_wire::<ProbePayload>(
+        json!({"type": "read_ok", "msg_id": 8, "in_reply_to": 1, "value": 42}),
+    );
+}
 
-    for (dest, msg_id) in [("n1", 2), ("n2", 3)] {
-        let request = next_outgoing(&mut recv).await;
-        assert_eq!(
-            serde_json::to_value(&request).unwrap(),
-            json!({
-                "src": "n0", "dest": dest,
-                "body": {"type": "unicast", "msg_id": msg_id, "messages": [10, 20]},
-            }),
-        );
-        let reply: Message = serde_json::from_value(json!({
-            "src": dest, "dest": "n0",
-            "body": {"type": "unicast_ok", "msg_id": 900, "in_reply_to": msg_id},
-        }))
-        .unwrap();
-        assert_eq!(request.unique_id(), reply.unique_id());
-        assert_eq!(request.unique_id(), format!("{dest}-{msg_id}"));
-    }
-    assert_eq!(numbering.next(), 4);
-
-    tokio::time::timeout(Duration::from_secs(1), task)
+async fn write_json(writer: &mut (impl AsyncWrite + Unpin), message: Value) {
+    writer
+        .write_all(format!("{message}\n").as_bytes())
         .await
-        .expect("batch did not exit after its input closed")
+        .unwrap();
+}
+
+#[test]
+fn in_reply_to_distinguishes_responses_when_payload_types_overlap() {
+    struct SharedPayload;
+    impl Payload for SharedPayload {
+        type Request = ProbeRequest;
+        type Response = ProbeRequest;
+    }
+    for (body, is_response) in [
+        (json!({"type": "read", "msg_id": 1}), false),
+        (json!({"type": "read", "msg_id": 2, "in_reply_to": 1}), true),
+    ] {
+        let message: Message<SharedPayload> =
+            serde_json::from_value(wire("n0", "n1", body)).unwrap();
+        assert_eq!(matches!(message.body, Body::Response { .. }), is_response);
+    }
+}
+
+async fn read_json(input: &mut tokio::io::Lines<impl AsyncBufRead + Unpin>) -> Value {
+    let line = timeout(Duration::from_secs(2), input.next_line())
+        .await
+        .unwrap()
         .unwrap()
         .unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_only_the_selected_request_until_the_matching_peer_replies() {
+    let (mut client, input) = duplex(4096);
+    let (output, reader) = duplex(4096);
+    let mut lines = BufReader::new(reader).lines();
+    let node = run::<ProbeNode>(BufReader::new(input), output);
+    let client_session = async move {
+        write_json(
+            &mut client,
+            wire(
+                "c0",
+                "n0",
+                json!({"type": "init", "msg_id": 70, "node_id": "n0", "node_ids": ["n0", "n1", "n2"]}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            read_json(&mut lines).await,
+            wire(
+                "n0",
+                "c0",
+                json!({"type": "init_ok", "msg_id": 0, "in_reply_to": 70})
+            )
+        );
+        write_json(
+            &mut client,
+            wire("c0", "n0", json!({"type": "start", "msg_id": 71})),
+        )
+        .await;
+        assert_eq!(
+            read_json(&mut lines).await,
+            wire("n0", "n1", json!({"type": "read", "msg_id": 1}))
+        );
+        let request = read_json(&mut lines).await;
+        assert_eq!(
+            request,
+            wire("n0", "n2", json!({"type": "read", "msg_id": 2}))
+        );
+
+        for (peer, in_reply_to, value) in [("n1", 2, 10), ("n2", 1, 15), ("n2", 2, 20)] {
+            write_json(
+                &mut client,
+                wire(
+                    peer,
+                    "n0",
+                    json!({"type": "read_ok", "msg_id": 8, "in_reply_to": in_reply_to, "value": value}),
+                ),
+            )
+            .await;
+            let forwarded = read_json(&mut lines).await;
+            assert_eq!(forwarded["body"]["value"], value);
+            assert_eq!(forwarded["body"]["in_reply_to"], in_reply_to);
+            if (peer, in_reply_to) != ("n2", 2) {
+                assert_eq!(read_json(&mut lines).await, request);
+            }
+        }
+        assert!(
+            timeout(Duration::from_secs(2), lines.next_line())
+                .await
+                .is_err()
+        );
+        drop(client);
+        assert!(
+            timeout(Duration::from_secs(1), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+    };
+    let (result, ()) = tokio::join!(node, client_session);
+    result.unwrap();
 }
