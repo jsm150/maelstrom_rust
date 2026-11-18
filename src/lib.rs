@@ -339,7 +339,7 @@ impl BroadcastBatch {
     }
 
     pub async fn run(mut self, delay: Duration) -> anyhow::Result<()> {
-        loop {
+        while !self.recv.is_closed() || !self.recv.is_empty() {
             tokio::time::sleep(delay).await;
 
             let mut messages = vec![];
@@ -368,6 +368,8 @@ impl BroadcastBatch {
                     .await?;
             }
         }
+
+        Ok(())
     }
 }
 

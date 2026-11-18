@@ -167,6 +167,7 @@ async fn batches_receive_fresh_ids_and_replies_match_requests() {
             .await
             .unwrap();
     }
+    drop(batch_sender);
     let batch = BroadcastBatch::new(
         "n0".into(),
         batch_recv,
@@ -195,6 +196,9 @@ async fn batches_receive_fresh_ids_and_replies_match_requests() {
     }
     assert_eq!(numbering.next(), 4);
 
-    task.abort();
-    let _ = task.await;
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("batch did not exit after its input closed")
+        .unwrap()
+        .unwrap();
 }
