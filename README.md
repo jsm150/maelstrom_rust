@@ -1,6 +1,6 @@
 # maelstrom_rust
 
-Fly.io Gossip Glomers 과제를 Rust로 구현합니다. `echo`, `unique-ids`, `broadcast`는
+Fly.io Gossip Glomers 과제를 Rust로 구현합니다. `echo`, `unique-ids`, `broadcast`, `g-counter`는
 각자 `Node`와 요청·응답 `Payload`를 정의하고 라이브러리의 `main_loop`에서 실행합니다.
 상위 디렉터리에 Maelstrom 0.2.3 배포본이 있습니다.
 
@@ -18,6 +18,8 @@ cargo build --release --locked --bins
   --node-count 5 --time-limit 20 --rate 10 --nemesis partition
 ../maelstrom test -w broadcast --bin "$PWD/target/release/broadcast" \
   --node-count 25 --time-limit 20 --rate 100 --latency 100
+../maelstrom test -w g-counter --bin "$PWD/target/release/g-counter" \
+  --node-count 3 --time-limit 20 --rate 100
 ```
 
 stdin에서 한 줄에 하나의 JSON 메시지를 읽고, stdout에 한 줄에 하나의 JSON 메시지를 출력합니다.
