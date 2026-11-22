@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
 type Offsets = HashMap<String, usize>;
+const POLL_READ_BATCH_SIZE: usize = 8;
 
 struct KafkaPayload;
 
@@ -171,17 +172,7 @@ async fn handle_request(kv: KvClient, request: IncomingRequest) -> KvResult<Outg
         }
         IncomingRequest::Poll { offsets } => {
             let logs = for_keys(kv, offsets, |kv, (key, start)| async move {
-                let end = kv
-                    .read(LIN_KV, json!(["next_offset", key]))
-                    .await?
-                    .unwrap_or(0);
-                let mut entries = Vec::new();
-                for offset in start..end {
-                    let Some(msg) = kv.read(SEQ_KV, json!([key, offset])).await? else {
-                        break;
-                    };
-                    entries.push((offset, msg));
-                }
+                let entries = poll_log(&kv, &key, start).await?;
                 Ok((key, entries))
             })
             .await?;
@@ -217,6 +208,36 @@ async fn handle_request(kv: KvClient, request: IncomingRequest) -> KvResult<Outg
             })
         }
     }
+}
+
+async fn poll_log(kv: &KvClient, key: &str, start: usize) -> KvResult<Vec<(usize, usize)>> {
+    let end = kv
+        .read(LIN_KV, json!(["next_offset", key]))
+        .await?
+        .unwrap_or(0);
+    let mut entries = Vec::new();
+    let mut reads = JoinSet::new();
+    let mut batch = Vec::new();
+    for first in (start..end).step_by(POLL_READ_BATCH_SIZE) {
+        let batch_end = end.min(first.saturating_add(POLL_READ_BATCH_SIZE));
+        for offset in first..batch_end {
+            let kv = kv.clone();
+            let log_key = json!([key, offset]);
+            reads.spawn(async move { (offset, kv.read(SEQ_KV, log_key).await) });
+        }
+        while let Some(result) = reads.join_next().await {
+            batch.push(result.map_err(RpcError::internal)?);
+        }
+        // 응답 도착 순서와 관계없이 첫 빈 오프셋 앞의 값과 오류만 반영한다.
+        batch.sort_unstable_by_key(|(offset, _)| *offset);
+        for (offset, result) in batch.drain(..) {
+            let Some(msg) = result? else {
+                return Ok(entries);
+            };
+            entries.push((offset, msg));
+        }
+    }
+    Ok(entries)
 }
 
 // 키별로 독립적인 RPC를 진행하고 각 작업이 끝난 뒤 클라이언트에 한 번만 응답한다.

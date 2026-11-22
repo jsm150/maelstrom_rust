@@ -81,6 +81,39 @@ impl Broker {
         send(&mut self.stdin, &wire("c1", self.id, body)).await;
     }
 
+    async fn reply_from_kv(&mut self, request: &Value, mut body: Value) {
+        body["in_reply_to"] = request["body"]["msg_id"].clone();
+        let service = request["dest"].as_str().unwrap();
+        send(&mut self.stdin, &wire(service, self.id, body)).await;
+    }
+
+    async fn begin_poll(&mut self, start: usize, end: usize) {
+        self.request(10, json!({"type":"poll", "offsets":{"orders":start}}))
+            .await;
+        let read = self.next().await;
+        assert_eq!(read["dest"], "lin-kv");
+        assert_eq!(read["body"]["type"], "read");
+        assert_eq!(read["body"]["key"], json!(["next_offset", "orders"]));
+        self.reply_from_kv(&read, json!({"type":"read_ok", "value":end}))
+            .await;
+    }
+
+    // 묶음 전체가 도착할 때까지 응답을 보류해 병렬 요청을 확인한다.
+    async fn poll_reads(&mut self, offsets: std::ops::Range<usize>) -> Vec<Value> {
+        let mut reads = Vec::new();
+        for _ in offsets.clone() {
+            let read = self.next().await;
+            assert_eq!(read["dest"], "seq-kv");
+            assert_eq!(read["body"]["type"], "read");
+            reads.push(read);
+        }
+        reads.sort_unstable_by_key(|read| read["body"]["key"][1].as_u64().unwrap());
+        for (offset, read) in offsets.zip(&reads) {
+            assert_eq!(read["body"]["key"], json!(["orders", offset]));
+        }
+        reads
+    }
+
     // 지정한 메시지는 테스트가 전달 시점을 제어하고, 나머지 KV 요청에는 즉시 응답한다.
     async fn until(&mut self, kv: &mut MockKv, dest: &str, kind: &str) -> Value {
         timeout(Duration::from_secs(5), async {
@@ -151,6 +184,63 @@ async fn kafka_assigns_offsets_per_key_and_polls_the_full_suffix() {
         ),
     ])
     .await;
+}
+
+#[tokio::test]
+async fn poll_reads_eight_offsets_at_a_time_and_returns_them_in_order() {
+    let mut node = Broker::start("n0").await;
+    node.begin_poll(10, 20).await;
+    let first = node.poll_reads(10..18).await;
+    for (offset, read) in (11..18).zip(&first[1..]).rev() {
+        node.reply_from_kv(read, json!({"type":"read_ok", "value":offset * 10}))
+            .await;
+    }
+
+    // 10번 응답을 보류한 동안 다음 묶음의 읽기가 출력되지 않아야 한다.
+    node.request(11, json!({"type":"poll", "offsets":{}})).await;
+    let empty_poll = node.next().await;
+    assert_eq!(empty_poll["body"]["type"], "poll_ok");
+    assert_eq!(empty_poll["body"]["in_reply_to"], 11);
+
+    node.reply_from_kv(&first[0], json!({"type":"read_ok", "value":100}))
+        .await;
+    let second = node.poll_reads(18..20).await;
+    for (offset, read) in (18..20).zip(&second).rev() {
+        node.reply_from_kv(read, json!({"type":"read_ok", "value":offset * 10}))
+            .await;
+    }
+    let reply = node.next().await;
+    let expected: Vec<_> = (10..20).map(|offset| [offset, offset * 10]).collect();
+    assert_eq!(reply["body"]["type"], "poll_ok");
+    assert_eq!(reply["body"]["in_reply_to"], 10);
+    assert_eq!(reply["body"]["msgs"], json!({"orders":expected}));
+}
+
+#[tokio::test]
+async fn poll_stops_at_the_first_gap_or_error_in_offset_order() {
+    for error_offset in [15, 11] {
+        let mut node = Broker::start("n0").await;
+        node.begin_poll(10, 20).await;
+        let reads = node.poll_reads(10..18).await;
+        for (offset, read) in (10..18).zip(&reads).rev() {
+            let response = match offset {
+                12 => json!({"type":"error", "code":20}),
+                n if n == error_offset => json!({"type":"error", "code":13, "text":"조회 실패"}),
+                _ => json!({"type":"read_ok", "value":offset}),
+            };
+            node.reply_from_kv(read, response).await;
+        }
+        let reply = node.next().await;
+        assert_eq!(reply["dest"], "c1");
+        assert_eq!(reply["body"]["in_reply_to"], 10);
+        if error_offset > 12 {
+            assert_eq!(reply["body"]["type"], "poll_ok");
+            assert_eq!(reply["body"]["msgs"], json!({"orders":[[10,10],[11,11]]}));
+        } else {
+            assert_eq!(reply["body"]["type"], "error");
+            assert_eq!(reply["body"]["code"], 13);
+        }
+    }
 }
 
 #[tokio::test]
