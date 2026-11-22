@@ -102,7 +102,7 @@ impl<P: Payload> NodeTx<P> {
             src: self.node_id.to_string(),
             dest: peer.to_owned(),
             body: Body::Response {
-                msg_id,
+                msg_id: Some(msg_id),
                 in_reply_to,
                 payload: make_payload(msg_id),
             },

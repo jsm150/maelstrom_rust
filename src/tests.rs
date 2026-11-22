@@ -65,22 +65,16 @@ fn wire(src: &str, dest: &str, body: Value) -> Value {
 fn check_wire<P: Payload>(body: Value) {
     let message = wire("c0", "n0", body);
     let parsed: Message<P> = serde_json::from_value(message.clone()).unwrap();
-    assert_eq!(
-        matches!(parsed.body, Body::Response { .. }),
-        message["body"].get("in_reply_to").is_some()
-    );
+    let is_response = message["body"].get("in_reply_to").is_some();
+    assert_eq!(matches!(parsed.body, Body::Response { .. }), is_response);
     assert_eq!(serde_json::to_value(parsed).unwrap(), message);
-    for key in ["msg_id", "in_reply_to"] {
-        let mut incomplete = message.clone();
-        if incomplete["body"]
-            .as_object_mut()
-            .unwrap()
-            .remove(key)
-            .is_some()
-        {
-            assert!(serde_json::from_value::<Message<P>>(incomplete).is_err());
-        }
-    }
+    let required_id = if is_response { "in_reply_to" } else { "msg_id" };
+    let mut incomplete = message;
+    incomplete["body"]
+        .as_object_mut()
+        .unwrap()
+        .remove(required_id);
+    assert!(serde_json::from_value::<Message<P>>(incomplete).is_err());
 }
 
 #[test]
@@ -93,6 +87,7 @@ fn wire_format_and_required_ids() {
     check_wire::<ProbePayload>(
         json!({"type": "read_ok", "msg_id": 8, "in_reply_to": 1, "value": 42}),
     );
+    check_wire::<ProbePayload>(json!({"type": "read_ok", "in_reply_to": 1, "value": 42}));
 }
 
 async fn write_json(writer: &mut (impl AsyncWrite + Unpin), message: Value) {
@@ -173,7 +168,7 @@ async fn retry_only_the_selected_request_until_the_matching_peer_replies() {
                 wire(
                     peer,
                     "n0",
-                    json!({"type": "read_ok", "msg_id": 8, "in_reply_to": in_reply_to, "value": value}),
+                    json!({"type": "read_ok", "in_reply_to": in_reply_to, "value": value}),
                 ),
             )
             .await;

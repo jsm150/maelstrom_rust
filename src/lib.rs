@@ -27,7 +27,8 @@ pub struct Message<P: Payload> {
 pub enum Body<P: Payload> {
     // Serde는 선언 순서대로 역직렬화를 시도하므로, in_reply_to가 필요한 응답을 먼저 검사한다.
     Response {
-        msg_id: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        msg_id: Option<usize>,
         in_reply_to: usize,
         #[serde(flatten)]
         payload: P::Response,
@@ -99,7 +100,7 @@ async fn run<N: Node>(
         src: init.node_id.clone(),
         dest: message.src,
         body: Body::Response {
-            msg_id: 0,
+            msg_id: Some(0),
             in_reply_to: msg_id,
             payload: InitResponse::InitOk,
         },

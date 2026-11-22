@@ -22,6 +22,8 @@ cargo build --release --locked --bins
   --node-count 3 --time-limit 20 --rate 100
 ../maelstrom test -w kafka --bin "$PWD/target/release/kafka" \
   --node-count 1 --concurrency 2n --time-limit 20 --rate 1000
+../maelstrom test -w kafka --bin "$PWD/target/release/kafka" \
+  --node-count 2 --concurrency 2n --time-limit 20 --rate 1000
 ```
 
 stdin에서 한 줄에 하나의 JSON 메시지를 읽고, stdout에 한 줄에 하나의 JSON 메시지를 출력합니다.
