@@ -74,6 +74,53 @@ async fn run_as(binary: &str, node_id: &str, node_ids: &[&str], input: &[Value])
 mod kafka;
 
 #[tokio::test]
+async fn txn_reads_committed_values_then_applies_writes_in_order() {
+    let request = |id, txn| wire("c1", "n0", json!({"type":"txn", "msg_id":id, "txn":txn}));
+    let input = [
+        request(10, json!([["w", 1, 3]])),
+        request(
+            11,
+            json!([
+                ["w", 1, 6],
+                ["r", 1, null],
+                ["w", 1, 8],
+                ["r", 1, null],
+                ["w", 2, -4],
+                ["r", 2, null]
+            ]),
+        ),
+        request(12, json!([["r", 1, null], ["r", 2, null]])),
+    ];
+    let output = run_as(env!("CARGO_BIN_EXE_txn"), "n0", &["n0"], &input).await;
+    let reply = |id, in_reply_to, txn| {
+        wire(
+            "n0",
+            "c1",
+            json!({"type":"txn_ok", "msg_id":id, "in_reply_to":in_reply_to, "txn":txn}),
+        )
+    };
+    assert_eq!(
+        output,
+        [
+            reply(1, 10, json!([["w", 1, 3]])),
+            reply(
+                2,
+                11,
+                json!([
+                    ["w", 1, 6],
+                    ["r", 1, 3],
+                    ["w", 1, 8],
+                    ["r", 1, 3],
+                    ["w", 2, -4],
+                    ["r", 2, null]
+                ]),
+            ),
+            reply(3, 12, json!([["r", 1, 8], ["r", 2, -4]])),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn counter_master_replicates_each_distinct_add_once_per_slave() {
     let direct = wire("c1", "n1", json!({"type": "add", "msg_id": 11, "delta": 5}));
     let forwarded = wire("n2", "n1", json!({"type": "add", "msg_id": 11, "delta": 3}));
