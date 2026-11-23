@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
 type Offsets = HashMap<String, usize>;
-const POLL_READ_BATCH_SIZE: usize = 8;
+type LogBlock = Vec<(usize, usize)>;
+const BLOCK_SIZE: usize = 8;
+const POLL_BATCH_BLOCKS: usize = 4;
 
 struct KafkaPayload;
 
@@ -159,13 +161,16 @@ async fn handle_request(kv: KvClient, request: IncomingRequest) -> KvResult<Outg
         IncomingRequest::Send { key, msg } => {
             let counter = json!(["next_offset", key]);
             loop {
-                let current = kv.read(LIN_KV, counter.clone()).await?;
+                let current = kv.read::<usize>(LIN_KV, counter.clone()).await?;
                 let offset = current.unwrap_or(0);
                 let next = offset
                     .checked_add(1)
                     .ok_or_else(|| RpcError::internal("오프셋 범위를 초과했습니다"))?;
-                if kv.cas(LIN_KV, counter.clone(), current, next).await? {
-                    kv.write(SEQ_KV, json!([key, offset]), msg).await?;
+                if kv
+                    .cas(LIN_KV, counter.clone(), current.as_ref(), &next)
+                    .await?
+                {
+                    store_entry(&kv, &key, offset, msg).await?;
                     return Ok(OutgoingResponse::SendOk { offset });
                 }
             }
@@ -186,9 +191,11 @@ async fn handle_request(kv: KvClient, request: IncomingRequest) -> KvResult<Outg
             for_keys(kv, offsets, |kv, (key, target)| async move {
                 let key = json!(["committed_offset", key]);
                 loop {
-                    let current = kv.read(LIN_KV, key.clone()).await?;
+                    let current = kv.read::<usize>(LIN_KV, key.clone()).await?;
                     if current.is_some_and(|offset| offset >= target)
-                        || kv.cas(LIN_KV, key.clone(), current, target).await?
+                        || kv
+                            .cas(LIN_KV, key.clone(), current.as_ref(), &target)
+                            .await?
                     {
                         return Ok(());
                     }
@@ -199,7 +206,9 @@ async fn handle_request(kv: KvClient, request: IncomingRequest) -> KvResult<Outg
         }
         IncomingRequest::ListCommittedOffsets { keys } => {
             let entries = for_keys(kv, keys, |kv, key| async move {
-                let offset = kv.read(LIN_KV, json!(["committed_offset", key])).await?;
+                let offset = kv
+                    .read::<usize>(LIN_KV, json!(["committed_offset", key]))
+                    .await?;
                 Ok(offset.map(|offset| (key, offset)))
             })
             .await?;
@@ -210,31 +219,65 @@ async fn handle_request(kv: KvClient, request: IncomingRequest) -> KvResult<Outg
     }
 }
 
+async fn store_entry(kv: &KvClient, key: &str, offset: usize, msg: usize) -> KvResult<()> {
+    let block_key = json!([key, offset / BLOCK_SIZE]);
+    loop {
+        let current = kv.read::<LogBlock>(SEQ_KV, block_key.clone()).await?;
+        let mut updated = current.clone().unwrap_or_default();
+        match updated.binary_search_by_key(&offset, |&(stored, _)| stored) {
+            Ok(i) if updated[i].1 == msg => return Ok(()),
+            Ok(_) => {
+                return Err(RpcError::internal(
+                    "오프셋에 다른 메시지가 이미 기록되었습니다",
+                ));
+            }
+            Err(i) => updated.insert(i, (offset, msg)),
+        }
+        // 같은 블록의 다른 쓰기가 먼저 성공하면 예약한 오프셋을 유지한 채 다시 병합한다.
+        if kv
+            .cas(SEQ_KV, block_key.clone(), current.as_ref(), &updated)
+            .await?
+        {
+            return Ok(());
+        }
+    }
+}
+
 async fn poll_log(kv: &KvClient, key: &str, start: usize) -> KvResult<Vec<(usize, usize)>> {
     let end = kv
-        .read(LIN_KV, json!(["next_offset", key]))
+        .read::<usize>(LIN_KV, json!(["next_offset", key]))
         .await?
         .unwrap_or(0);
     let mut entries = Vec::new();
+    if start >= end {
+        return Ok(entries);
+    }
+    let block_end = end.div_ceil(BLOCK_SIZE);
     let mut reads = JoinSet::new();
     let mut batch = Vec::new();
-    for first in (start..end).step_by(POLL_READ_BATCH_SIZE) {
-        let batch_end = end.min(first.saturating_add(POLL_READ_BATCH_SIZE));
-        for offset in first..batch_end {
+    for first in (start / BLOCK_SIZE..block_end).step_by(POLL_BATCH_BLOCKS) {
+        for block_no in first..block_end.min(first + POLL_BATCH_BLOCKS) {
             let kv = kv.clone();
-            let log_key = json!([key, offset]);
-            reads.spawn(async move { (offset, kv.read(SEQ_KV, log_key).await) });
+            let block_key = json!([key, block_no]);
+            reads.spawn(async move { (block_no, kv.read::<LogBlock>(SEQ_KV, block_key).await) });
         }
         while let Some(result) = reads.join_next().await {
             batch.push(result.map_err(RpcError::internal)?);
         }
         // 응답 도착 순서와 관계없이 첫 빈 오프셋 앞의 값과 오류만 반영한다.
-        batch.sort_unstable_by_key(|(offset, _)| *offset);
-        for (offset, result) in batch.drain(..) {
-            let Some(msg) = result? else {
+        batch.sort_unstable_by_key(|(block_no, _)| *block_no);
+        for (block_no, result) in batch.drain(..) {
+            let Some(block) = result? else {
                 return Ok(entries);
             };
-            entries.push((offset, msg));
+            let base = block_no * BLOCK_SIZE;
+            let mut records = block.into_iter().skip_while(|&(offset, _)| offset < start);
+            for expected in start.max(base)..end.min(base.saturating_add(BLOCK_SIZE)) {
+                match records.next() {
+                    Some(entry) if entry.0 == expected => entries.push(entry),
+                    _ => return Ok(entries),
+                }
+            }
         }
     }
     Ok(entries)

@@ -25,10 +25,6 @@ impl MockKv {
                 Some(value) => json!({"type": "read_ok", "value": value}),
                 None => json!({"type": "error", "code": 20}),
             },
-            "write" => {
-                self.data.insert(key, body["value"].clone());
-                json!({"type": "write_ok"})
-            }
             "cas" => match self.data.get(&key) {
                 Some(value) if *value != body["from"] => json!({"type": "error", "code": 22}),
                 None if body["create_if_not_exists"] != true => {
@@ -99,17 +95,17 @@ impl Broker {
     }
 
     // 묶음 전체가 도착할 때까지 응답을 보류해 병렬 요청을 확인한다.
-    async fn poll_reads(&mut self, offsets: std::ops::Range<usize>) -> Vec<Value> {
+    async fn poll_reads(&mut self, blocks: std::ops::Range<usize>) -> Vec<Value> {
         let mut reads = Vec::new();
-        for _ in offsets.clone() {
+        for _ in blocks.clone() {
             let read = self.next().await;
             assert_eq!(read["dest"], "seq-kv");
             assert_eq!(read["body"]["type"], "read");
             reads.push(read);
         }
         reads.sort_unstable_by_key(|read| read["body"]["key"][1].as_u64().unwrap());
-        for (offset, read) in offsets.zip(&reads) {
-            assert_eq!(read["body"]["key"], json!(["orders", offset]));
+        for (block_no, read) in blocks.zip(&reads) {
+            assert_eq!(read["body"]["key"], json!(["orders", block_no]));
         }
         reads
     }
@@ -187,55 +183,164 @@ async fn kafka_assigns_offsets_per_key_and_polls_the_full_suffix() {
 }
 
 #[tokio::test]
-async fn poll_reads_eight_offsets_at_a_time_and_returns_them_in_order() {
+async fn poll_reads_four_blocks_at_a_time_and_returns_only_the_requested_offsets() {
     let mut node = Broker::start("n0").await;
-    node.begin_poll(10, 20).await;
-    let first = node.poll_reads(10..18).await;
-    for (offset, read) in (11..18).zip(&first[1..]).rev() {
-        node.reply_from_kv(read, json!({"type":"read_ok", "value":offset * 10}))
-            .await;
+    node.begin_poll(5, 35).await;
+    let first = node.poll_reads(0..4).await;
+    for (block_no, read) in (1..4).zip(&first[1..]).rev() {
+        let base = block_no * 8;
+        node.reply_from_kv(read, block_reply(base..base + 8)).await;
     }
 
-    // 10번 응답을 보류한 동안 다음 묶음의 읽기가 출력되지 않아야 한다.
+    // 0번 블록의 응답을 보류한 동안 다음 묶음의 읽기가 출력되지 않아야 한다.
     node.request(11, json!({"type":"poll", "offsets":{}})).await;
     let empty_poll = node.next().await;
     assert_eq!(empty_poll["body"]["type"], "poll_ok");
     assert_eq!(empty_poll["body"]["in_reply_to"], 11);
 
-    node.reply_from_kv(&first[0], json!({"type":"read_ok", "value":100}))
-        .await;
-    let second = node.poll_reads(18..20).await;
-    for (offset, read) in (18..20).zip(&second).rev() {
-        node.reply_from_kv(read, json!({"type":"read_ok", "value":offset * 10}))
-            .await;
-    }
+    node.reply_from_kv(&first[0], block_reply(5..8)).await;
+    let second = node.poll_reads(4..5).await;
+    node.reply_from_kv(&second[0], block_reply(32..40)).await;
     let reply = node.next().await;
-    let expected: Vec<_> = (10..20).map(|offset| [offset, offset * 10]).collect();
+    let expected: Vec<_> = (5..35).map(|offset| [offset, offset * 10]).collect();
     assert_eq!(reply["body"]["type"], "poll_ok");
     assert_eq!(reply["body"]["in_reply_to"], 10);
     assert_eq!(reply["body"]["msgs"], json!({"orders":expected}));
 }
 
+fn block_reply(offsets: std::ops::Range<usize>) -> Value {
+    let entries: Vec<_> = offsets.map(|offset| [offset, offset * 10]).collect();
+    json!({"type":"read_ok", "value":entries})
+}
+
+#[tokio::test]
+async fn sends_fill_blocks_of_eight_and_poll_reads_one_full_block_once() {
+    let mut node = Broker::start("n0").await;
+    let mut kv = MockKv::default();
+    for offset in 0..24 {
+        node.request(
+            100 + offset,
+            json!({"type":"send","key":"orders","msg":offset * 10}),
+        )
+        .await;
+        node.expect_reply(
+            &mut kv,
+            100 + offset,
+            json!({"type":"send_ok","offset":offset}),
+        )
+        .await;
+    }
+    for (block_no, offsets) in [0..8, 8..16, 16..24].into_iter().enumerate() {
+        let key = ("seq-kv".to_owned(), json!(["orders", block_no]).to_string());
+        assert_eq!(kv.data[&key], block_reply(offsets)["value"]);
+    }
+    node.request(10, json!({"type":"poll","offsets":{"orders":16}}))
+        .await;
+    let read = node.until(&mut kv, "seq-kv", "read").await;
+    assert_eq!(read["body"]["key"], json!(["orders", 2]));
+    send(&mut node.stdin, &kv.handle(&read)).await;
+    let reply = node.next().await;
+    assert_eq!(reply["body"]["type"], "poll_ok");
+    assert_eq!(
+        reply["body"]["msgs"]["orders"],
+        block_reply(16..24)["value"]
+    );
+}
+
+#[tokio::test]
+async fn concurrent_block_creation_preserves_both_reserved_offsets() {
+    let mut first = Broker::start("n0").await;
+    let mut second = Broker::start("n1").await;
+    let mut kv = MockKv::default();
+    first
+        .request(1, json!({"type":"send","key":"orders","msg":0}))
+        .await;
+    let create0 = first.until(&mut kv, "seq-kv", "cas").await;
+    second
+        .request(2, json!({"type":"send","key":"orders","msg":20}))
+        .await;
+    let create1 = second.until(&mut kv, "seq-kv", "cas").await;
+    for request in [&create0, &create1] {
+        assert_eq!(request["body"]["key"], json!(["orders", 0]));
+        assert_eq!(request["body"]["from"], Value::Null);
+        assert_eq!(request["body"]["create_if_not_exists"], true);
+    }
+    assert_eq!(create0["body"]["to"], json!([[0, 0]]));
+    assert_eq!(create1["body"]["to"], json!([[1, 20]]));
+    send(&mut second.stdin, &kv.handle(&create1)).await;
+    second
+        .expect_reply(&mut kv, 2, json!({"type":"send_ok","offset":1}))
+        .await;
+    let conflict = kv.handle(&create0);
+    assert_eq!(conflict["body"]["code"], 22);
+    send(&mut first.stdin, &conflict).await;
+    first
+        .expect_reply(&mut kv, 1, json!({"type":"send_ok","offset":0}))
+        .await;
+    second
+        .request(3, json!({"type":"poll","offsets":{"orders":0}}))
+        .await;
+    second
+        .expect_reply(
+            &mut kv,
+            3,
+            json!({"type":"poll_ok","msgs":{"orders":[[0,0],[1,20]]}}),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn poll_reports_wrong_metadata_and_block_value_types() {
+    let mut node = Broker::start("n0").await;
+    node.request(1, json!({"type":"poll","offsets":{"orders":0}}))
+        .await;
+    let counter = node.next().await;
+    node.reply_from_kv(&counter, block_reply(0..1)).await;
+    let reply = node.next().await;
+    assert_eq!(reply["body"]["type"], "error");
+    assert_eq!(reply["body"]["code"], 13);
+
+    node.begin_poll(0, 1).await;
+    let reads = node.poll_reads(0..1).await;
+    node.reply_from_kv(&reads[0], json!({"type":"read_ok","value":42}))
+        .await;
+    let reply = node.next().await;
+    assert_eq!(reply["body"]["type"], "error");
+    assert_eq!(reply["body"]["code"], 13);
+}
+
+#[tokio::test]
+async fn poll_stops_when_the_last_offset_of_a_block_is_missing() {
+    let mut node = Broker::start("n0").await;
+    node.begin_poll(6, 9).await;
+    let reads = node.poll_reads(0..2).await;
+    node.reply_from_kv(&reads[1], block_reply(8..9)).await;
+    node.reply_from_kv(&reads[0], block_reply(0..7)).await;
+    let reply = node.next().await;
+    assert_eq!(reply["body"]["type"], "poll_ok");
+    assert_eq!(reply["body"]["msgs"], json!({"orders":[[6,60]]}));
+}
+
 #[tokio::test]
 async fn poll_stops_at_the_first_gap_or_error_in_offset_order() {
-    for error_offset in [15, 11] {
+    for error_block in [3, 0] {
         let mut node = Broker::start("n0").await;
-        node.begin_poll(10, 20).await;
-        let reads = node.poll_reads(10..18).await;
-        for (offset, read) in (10..18).zip(&reads).rev() {
-            let response = match offset {
-                12 => json!({"type":"error", "code":20}),
-                n if n == error_offset => json!({"type":"error", "code":13, "text":"조회 실패"}),
-                _ => json!({"type":"read_ok", "value":offset}),
+        node.begin_poll(6, 40).await;
+        let reads = node.poll_reads(0..4).await;
+        for (block_no, read) in (0..4).zip(&reads).rev() {
+            let response = match block_no {
+                1 => json!({"type":"error", "code":20}),
+                n if n == error_block => json!({"type":"error", "code":13, "text":"조회 실패"}),
+                _ => block_reply(block_no * 8..block_no * 8 + 8),
             };
             node.reply_from_kv(read, response).await;
         }
         let reply = node.next().await;
         assert_eq!(reply["dest"], "c1");
         assert_eq!(reply["body"]["in_reply_to"], 10);
-        if error_offset > 12 {
+        if error_block > 1 {
             assert_eq!(reply["body"]["type"], "poll_ok");
-            assert_eq!(reply["body"]["msgs"], json!({"orders":[[10,10],[11,11]]}));
+            assert_eq!(reply["body"]["msgs"], json!({"orders":[[6,60],[7,70]]}));
         } else {
             assert_eq!(reply["body"]["type"], "error");
             assert_eq!(reply["body"]["code"], 13);
@@ -315,9 +420,11 @@ async fn concurrent_sends_retry_allocation_and_poll_stops_at_the_unwritten_offse
         assert_eq!(cas["body"]["to"], 2);
     }
     send(&mut first.stdin, &kv.handle(&cas1)).await;
-    let write = first.until(&mut kv, "seq-kv", "write").await;
-    assert_eq!(write["body"]["key"], json!(["orders", 1]));
-    assert_eq!(write["body"]["value"], 101);
+    let insert = first.until(&mut kv, "seq-kv", "cas").await;
+    assert_eq!(insert["body"]["key"], json!(["orders", 0]));
+    assert_eq!(insert["body"]["from"], json!([[0, 100]]));
+    assert_eq!(insert["body"]["to"], json!([[0, 100], [1, 101]]));
+    assert_eq!(insert["body"]["create_if_not_exists"], false);
 
     let conflict = kv.handle(&cas2);
     assert_eq!(conflict["body"]["code"], 22);
@@ -357,7 +464,20 @@ async fn concurrent_sends_retry_allocation_and_poll_stops_at_the_unwritten_offse
         )
         .await;
 
-    send(&mut first.stdin, &kv.handle(&write)).await;
+    let conflict = kv.handle(&insert);
+    assert_eq!(conflict["body"]["code"], 22);
+    send(&mut first.stdin, &conflict).await;
+    let reread = first.next().await;
+    assert_eq!(reread["dest"], "seq-kv");
+    assert_eq!(reread["body"]["type"], "read");
+    assert_eq!(reread["body"]["key"], insert["body"]["key"]);
+    send(&mut first.stdin, &kv.handle(&reread)).await;
+    let retry = first.next().await;
+    assert_eq!(retry["dest"], "seq-kv");
+    assert_eq!(retry["body"]["type"], "cas");
+    assert_eq!(retry["body"]["from"], json!([[0, 100], [2, 102]]));
+    assert_eq!(retry["body"]["to"], json!([[0, 100], [1, 101], [2, 102]]));
+    send(&mut first.stdin, &kv.handle(&retry)).await;
     first
         .expect_reply(&mut kv, 11, json!({"type":"send_ok","offset":1}))
         .await;
@@ -424,27 +544,20 @@ async fn concurrent_commits_recheck_the_target_after_a_conflict() {
 
 #[tokio::test]
 async fn ambiguous_cas_result_does_not_allocate_another_offset() {
-    let mut node = Broker::start("n0").await;
-    let mut kv = MockKv::default();
-    node.request(10, json!({"type":"send","key":"k","msg":5}))
-        .await;
-    let cas = node.until(&mut kv, "lin-kv", "cas").await;
-    let applied = kv.handle(&cas);
-    assert_eq!(applied["body"]["type"], "cas_ok");
-    send(
-        &mut node.stdin,
-        &wire(
-            "lin-kv",
-            "n0",
-            json!({
-                "type":"error", "code":0, "in_reply_to":cas["body"]["msg_id"]
-            }),
-        ),
-    )
-    .await;
-    let reply = node.next().await;
-    assert_eq!(reply["dest"], "c1");
-    assert_eq!(reply["body"]["in_reply_to"], 10);
-    assert_eq!(reply["body"]["type"], "error");
-    assert_eq!(reply["body"]["code"], 0);
+    for service in ["lin-kv", "seq-kv"] {
+        let mut node = Broker::start("n0").await;
+        let mut kv = MockKv::default();
+        node.request(10, json!({"type":"send","key":"k","msg":5}))
+            .await;
+        let cas = node.until(&mut kv, service, "cas").await;
+        let applied = kv.handle(&cas);
+        assert_eq!(applied["body"]["type"], "cas_ok");
+        node.reply_from_kv(&cas, json!({"type":"error", "code":0}))
+            .await;
+        let reply = node.next().await;
+        assert_eq!(reply["dest"], "c1");
+        assert_eq!(reply["body"]["in_reply_to"], 10);
+        assert_eq!(reply["body"]["type"], "error");
+        assert_eq!(reply["body"]["code"], 0);
+    }
 }

@@ -1,7 +1,8 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use maelstrom_rust::NodeTx;
-use serde_json::{Value, json};
+use serde::{Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use tokio::sync::{Mutex, oneshot};
 
 use super::{IncomingResponse, KafkaPayload, KafkaRequest, OutgoingRequest, RpcError};
@@ -66,9 +67,13 @@ impl KvClient {
         }
     }
 
-    pub(super) async fn read(&self, service: &str, key: Value) -> KvResult<Option<usize>> {
+    pub(super) async fn read<T: DeserializeOwned>(
+        &self,
+        service: &str,
+        key: Value,
+    ) -> KvResult<Option<T>> {
         match self.request(service, OutgoingRequest::Read { key }).await {
-            Ok(IncomingResponse::ReadOk { value }) => serde_json::from_value(value)
+            Ok(IncomingResponse::ReadOk { value }) => serde_json::from_value::<T>(value)
                 .map(Some)
                 .map_err(RpcError::internal),
             Err(RpcError { code: 20, .. }) => Ok(None),
@@ -77,34 +82,18 @@ impl KvClient {
         }
     }
 
-    pub(super) async fn write(&self, service: &str, key: Value, value: usize) -> KvResult<()> {
-        match self
-            .request(
-                service,
-                OutgoingRequest::Write {
-                    key,
-                    value: json!(value),
-                },
-            )
-            .await?
-        {
-            IncomingResponse::WriteOk => Ok(()),
-            _ => Err(RpcError::internal("write 응답 형식이 올바르지 않습니다")),
-        }
-    }
-
     // 조건 불일치만 false로 반환한다. 결과가 불확실한 오류는 호출자에게 전달한다.
-    pub(super) async fn cas(
+    pub(super) async fn cas<T: Serialize>(
         &self,
         service: &str,
         key: Value,
-        from: Option<usize>,
-        to: usize,
+        from: Option<&T>,
+        to: &T,
     ) -> KvResult<bool> {
         let request = OutgoingRequest::Cas {
             key,
-            from: json!(from),
-            to: json!(to),
+            from: serde_json::to_value(from).map_err(RpcError::internal)?,
+            to: serde_json::to_value(to).map_err(RpcError::internal)?,
             create_if_not_exists: from.is_none(),
         };
         match self.request(service, request).await {
