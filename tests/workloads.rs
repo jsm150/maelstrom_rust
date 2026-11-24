@@ -72,6 +72,8 @@ async fn run_as(binary: &str, node_id: &str, node_ids: &[&str], input: &[Value])
 
 #[path = "workloads/kafka.rs"]
 mod kafka;
+#[path = "workloads/txn.rs"]
+mod txn;
 
 #[tokio::test]
 async fn txn_reads_committed_values_then_applies_writes_in_order() {
